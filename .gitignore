@@ -4,3 +4,4 @@ crontab*
 logs/*.log
 __pycache__/
 *.pyc
+*.db
