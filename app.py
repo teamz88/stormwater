@@ -10,6 +10,7 @@ import logging
 import argparse
 from ntfybro import NtfyNotifier
 from dotenv import load_dotenv
+from database import ReportsDatabase
 
 # Load environment variables from .env file
 load_dotenv()
@@ -41,6 +42,9 @@ notifier = NtfyNotifier(
     default_topic="stormwater",
     default_icon="https://stormwaterpro.compli.cloud/images/faviconx2.png"
 )
+
+# Initialize database
+db = ReportsDatabase()
 
 def check_login_required(page):
     """Check if login form is present"""
@@ -334,15 +338,23 @@ with sync_playwright() as p:
             }
             reports_data.append(report)
         
-        # Save reports data to JSON file
+        # Save reports to JSON file
         with open('reports.json', 'w', encoding='utf-8') as f:
             json.dump(reports_data, f, indent=4, ensure_ascii=False)
-        
+
         logging.info(f"Successfully saved {len(reports_data)} reports for {filter_date} to reports.json")
+        
+        # Get only new reports (not in database before this run)
+        new_reports = db.get_new_reports(reports_data)
+        logging.info(f"Found {len(new_reports)} new reports to process")
+        
+        # Save all reports to database (including existing ones for updates)
+        db_inserted_count = db.insert_reports_batch(reports_data)
+        logging.info(f"Inserted/updated {db_inserted_count} reports in database")
         
         # Send success notification
         notifier.send_success(
-            f"Successfully scraped {len(reports_data)} reports for {filter_date}",
+            f"Successfully scraped {len(reports_data)} reports for {filter_date} ({len(new_reports)} new)",
             "Stormwater Reports Scraped"
         )
         
@@ -352,9 +364,9 @@ with sync_playwright() as p:
                 pdf_file.unlink()
             logging.info("Cleaned up old PDF files in Downloads")
         
-        # Download PDFs
-        logging.info("\nStarting PDF downloads...")
-        for report in reports_data:
+       # Download PDFs for new reports only
+        logging.info(f"\nStarting PDF downloads for {len(new_reports)} new reports...")
+        for report in new_reports:
             try:
                 logging.info(f"Starting download for {report['report_definition_url']}")
                 page.goto(report['report_definition_url'])
@@ -388,6 +400,9 @@ with sync_playwright() as p:
                     download.save_as(downloads_dir / new_filename)
                     logging.info(f"PDF saved as: {new_filename} (original: {original_filename})")
                     
+                    # Mark PDF as downloaded in database
+                    db.mark_pdf_downloaded(report['rd_id'])
+                    
                     time.sleep(2)  # Wait for download to complete
                 except Exception as e:
                     logging.warning(f"No download button found for {report['site']}: {e}")
@@ -408,26 +423,28 @@ with sync_playwright() as p:
         # Check if any PDF files were downloaded
         pdf_files = list(downloads_dir.glob('*.pdf')) if downloads_dir.exists() else []
         
-        if pdf_files:
-            logging.info(f"Found {len(pdf_files)} PDF files, proceeding with webhook")
+        if new_reports and pdf_files:
+            logging.info(f"Found {len(pdf_files)} PDF files for {len(new_reports)} new reports, proceeding with webhook")
             
-            # Send data to n8n webhook if configured
+            # Send to n8n webhook if URL is provided
             webhook_url = os.getenv("N8N_WEBHOOK_URL")
             if webhook_url:
                 try:
-                    send_to_n8n_webhook(reports_data, downloads_dir, webhook_url)
+                    send_to_n8n_webhook(new_reports, downloads_dir, webhook_url)
                 except Exception as e:
                     logging.error(f"Error sending to n8n webhook: {e}")
                     notifier.send_error(f"Error sending to n8n webhook: {e}", "Webhook Send Error")
                     send_error_to_n8n_webhook(e, "webhook_error", {
                         "webhook_url": webhook_url, 
-                        "reports_count": len(reports_data)
+                        "reports_count": len(new_reports)
                     })
             else:
                 logging.warning("N8N_WEBHOOK_URL environment variable not set")
+        elif not new_reports:
+            logging.info("No new reports found, skipping webhook send to n8n")
         else:
-            logging.warning("No PDF files found, skipping webhook send to n8n")
-            notifier.send_error("No PDF files were downloaded, webhook not sent", "No PDFs Downloaded")
+            logging.warning("No PDF files found for new reports, skipping webhook send to n8n")
+            notifier.send_error("No PDF files were downloaded for new reports, webhook not sent", "No PDFs Downloaded")
             
     except Exception as e:
         logging.error(f"An error occurred: {e}")
