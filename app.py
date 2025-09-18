@@ -272,7 +272,7 @@ with sync_playwright() as p:
         
         # Wait for data table to be present (this confirms we're on the right page)
         try:
-            page.wait_for_selector("#dataTable_length", timeout=60000)
+            page.wait_for_selector("#dataTable_length", timeout=300000)
             logging.info("Data table found, page loaded successfully")
         except Exception as e:
             logging.error(f"Data table not found. Current URL: {page.url}")
@@ -377,7 +377,7 @@ with sync_playwright() as p:
                     page.goto(report['report_definition_url'])
                 
                 # Wait for report to generate
-                page.wait_for_selector("#report-generating", state="hidden", timeout=20000)
+                page.wait_for_selector("#report-generating", state="hidden", timeout=300000)
                 
                 # Try to find and click download button
                 try:
