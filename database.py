@@ -61,11 +61,24 @@ class ReportsDatabase:
                 cursor = conn.cursor()
                 
                 cursor.execute("""
-                    INSERT OR REPLACE INTO reports 
-                    (id, site, site_url, program, report_type, report_definition, 
-                     report_definition_url, rd_id, site_tags, publishing_user, date, time)
+                    INSERT INTO reports 
+                    (rd_id, id, site, site_url, program, report_type, report_definition, 
+                     report_definition_url, site_tags, publishing_user, date, time)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(rd_id) DO UPDATE SET
+                        id=excluded.id,
+                        site=excluded.site,
+                        site_url=excluded.site_url,
+                        program=excluded.program,
+                        report_type=excluded.report_type,
+                        report_definition=excluded.report_definition,
+                        report_definition_url=excluded.report_definition_url,
+                        site_tags=excluded.site_tags,
+                        publishing_user=excluded.publishing_user,
+                        date=excluded.date,
+                        time=excluded.time
                 """, (
+                    report['rd_id'],
                     report['id'],
                     report['site'],
                     report['site_url'],
@@ -73,7 +86,6 @@ class ReportsDatabase:
                     report['report_type'],
                     report['report_definition'],
                     report['report_definition_url'],
-                    report['rd_id'],
                     report['site_tags'],
                     report['publishing_user'],
                     report['date'],
@@ -86,7 +98,7 @@ class ReportsDatabase:
         except Exception as e:
             logging.error(f"Error inserting report {report.get('id', 'unknown')}: {e}")
             return False
-    
+
     def insert_reports_batch(self, reports: List[Dict[str, Any]]) -> int:
         """Insert multiple reports into the database"""
         inserted_count = 0
@@ -118,10 +130,22 @@ class ReportsDatabase:
                             continue
                         
                         cursor.execute("""
-                            INSERT OR REPLACE INTO reports 
+                            INSERT INTO reports 
                             (rd_id, id, site, site_url, program, report_type, report_definition, 
                              report_definition_url, site_tags, publishing_user, date, time)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(rd_id) DO UPDATE SET
+                                id=excluded.id,
+                                site=excluded.site,
+                                site_url=excluded.site_url,
+                                program=excluded.program,
+                                report_type=excluded.report_type,
+                                report_definition=excluded.report_definition,
+                                report_definition_url=excluded.report_definition_url,
+                                site_tags=excluded.site_tags,
+                                publishing_user=excluded.publishing_user,
+                                date=excluded.date,
+                                time=excluded.time
                         """, (
                             report.get('rd_id', ''),
                             report['id'],
@@ -279,3 +303,32 @@ class ReportsDatabase:
         except Exception as e:
             logging.error(f"Error getting database stats: {e}")
             return {}
+    
+    def is_pdf_downloaded(self, rd_id: str) -> bool:
+        """Check if a report's PDF has been downloaded"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
+                cursor = conn.cursor()
+                cursor.execute("SELECT pdf_downloaded FROM reports WHERE rd_id = ?", (rd_id,))
+                row = cursor.fetchone()
+                return bool(row and row[0])
+        except Exception as e:
+            logging.error(f"Error checking pdf_downloaded for rd_id {rd_id}: {e}")
+            return False
+
+    def get_reports_missing_pdf(self, reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return reports whose PDFs have not been downloaded yet, based on the database flag"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
+                cursor = conn.cursor()
+                cursor.execute("SELECT rd_id FROM reports WHERE pdf_downloaded = TRUE")
+                downloaded_ids = {row[0] for row in cursor.fetchall()}
+        except Exception as e:
+            logging.error(f"Error fetching downloaded rd_ids: {e}")
+            downloaded_ids = set()
+
+        missing = [r for r in reports if r.get('rd_id') and r['rd_id'] not in downloaded_ids]
+        logging.info(f"Found {len(missing)} reports missing PDFs out of {len(reports)} total")
+        return missing

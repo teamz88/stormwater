@@ -47,10 +47,9 @@ notifier = NtfyNotifier(
 db = ReportsDatabase()
 
 def check_login_required(page):
-    """Check if login form is present"""
+    """Check if login form is present quickly without long blocking wait"""
     try:
-        page.wait_for_selector("#i-username", timeout=300000)
-        return True
+        return page.query_selector("#i-username") is not None
     except:
         return False
 
@@ -70,15 +69,23 @@ def perform_login(page):
         # Wait for navigation after login
         page.wait_for_load_state("networkidle")
         
-        # Check if login was successful by looking for login form absence
-        try:
-            page.wait_for_selector("#i-username", timeout=300000)
-            logging.error("Login failed - login form still present")
-            notifier.send_error("Login failed - login form still present", "Authentication Error")
-            return False
-        except:
-            logging.info("Login successful")
-            return True
+        # Adaptive check: wait until login form disappears OR data table appears, up to 5 minutes
+        start = time.time()
+        max_wait_s = 300
+        while time.time() - start < max_wait_s:
+            # If login form gone, we are logged in
+            if page.query_selector("#i-username") is None:
+                logging.info("Login successful")
+                return True
+            # If data table appeared, consider login successful
+            if page.query_selector("#dataTable_length") or page.query_selector("#dataTable tbody tr"):
+                logging.info("Login successful - data table detected")
+                return True
+            time.sleep(0.5)
+
+        logging.error("Login failed - login form still present")
+        notifier.send_error("Login failed - login form still present", "Authentication Error")
+        return False
             
     except Exception as e:
         logging.error(f"Login error: {e}")
@@ -211,6 +218,23 @@ def send_to_n8n_webhook(reports_data, downloads_dir, webhook_url):
         send_error_to_n8n_webhook(e, "webhook_send_error", {"webhook_url": webhook_url, "reports_count": len(reports_data) if 'reports_data' in locals() else 0})
 
 # Check required environment variables
+def wait_for_auth_or_table(page, max_wait_ms: int = 300000, poll_interval_ms: int = 500):
+    """Wait until either login form appears or data table is present. Returns 'login', 'table', or 'timeout'."""
+    start = time.time()
+    max_wait_s = max_wait_ms / 1000.0
+    interval_s = poll_interval_ms / 1000.0
+    while time.time() - start < max_wait_s:
+        try:
+            if page.query_selector("#i-username"):
+                return "login"
+            if page.query_selector("#dataTable_length") or page.query_selector("#dataTable tbody tr"):
+                return "table"
+        except Exception:
+            # Ignore transient errors during navigation
+            pass
+        time.sleep(interval_s)
+    return "timeout"
+
 required_env_vars = ["STORMWATER_USERNAME", "STORMWATER_PASSWORD", "STORMWATER_REPORT_URL"]
 for var in required_env_vars:
     if not os.getenv(var):
@@ -252,8 +276,9 @@ with sync_playwright() as p:
         target_url = os.getenv("STORMWATER_REPORT_URL", "https://stormwaterpro.compli.cloud/analytics/reports/created-by-period")
         page.goto(target_url)
         
-        # Check if login is required
-        if check_login_required(page):
+        # Adaptive: wait until either login detected or table ready
+        state = wait_for_auth_or_table(page)
+        if state == "login":
             logging.info("Login form detected, starting login process...")
             if not perform_login(page):
                 error_msg = "Login failed, terminating program..."
@@ -262,11 +287,12 @@ with sync_playwright() as p:
                 send_error_to_n8n_webhook(error_msg, "authentication_error", {"url": target_url})
                 browser.close()
                 exit(1)
-            
             # Navigate to target URL after login
             page.goto(target_url)
-        else:
+        elif state == "table":
             logging.info("No login required, continuing...")
+        else:
+            logging.warning("Neither login nor data table appeared within timeout, continuing with default waits")
         
         # Wait for page to load completely after navigation
         page.wait_for_load_state("networkidle")
@@ -362,55 +388,98 @@ with sync_playwright() as p:
             "Stormwater Reports Scraped"
         )
         
+        # Determine which reports are missing PDFs (DB-driven)
+        missing_pdf_reports = db.get_reports_missing_pdf(reports_data)
+        logging.info(f"Found {len(missing_pdf_reports)} reports missing PDFs to process")
+        
         # Clean up old PDF files in Downloads
         if downloads_dir.exists():
             for pdf_file in downloads_dir.glob('*.pdf'):
                 pdf_file.unlink()
             logging.info("Cleaned up old PDF files in Downloads")
         
-       # Download PDFs for new reports only
-        logging.info(f"\nStarting PDF downloads for {len(new_reports)} new reports...")
-        for report in new_reports:
+       # Download PDFs for reports missing PDFs only
+        logging.info(f"\nStarting PDF downloads for {len(missing_pdf_reports)} reports missing PDFs...")
+        for report in missing_pdf_reports:
             try:
-                logging.info(f"Starting download for {report['report_definition_url']}")
-                page.goto(report['report_definition_url'])
-                page.wait_for_load_state("networkidle")
-                
-                if check_login_required(page):
-                    perform_login(page)
+                # Retry until the PDF for this report exists or timeout
+                start_dl = time.time()
+                max_wait_s = 300
+                attempt = 0
+                while True:
+                    # If file already exists for this rd_id, move on
+                    existing = list(downloads_dir.glob(f"{report['rd_id']}_*.pdf"))
+                    if existing:
+                        logging.info(f"PDF already present for {report['site']} ({report['rd_id']}): {existing[0].name}")
+                        db.mark_pdf_downloaded(report['rd_id'])
+                        break
+
+                    attempt += 1
+                    logging.info(f"Starting download attempt {attempt} for {report['report_definition_url']}")
                     page.goto(report['report_definition_url'])
-                
-                # Wait for report to generate
-                page.wait_for_selector("#report-generating", state="hidden", timeout=300000)
-                
-                # Try to find and click download button
-                try:
-                    download_button = page.locator("#downloadUrl")
-                    download_button.scroll_into_view_if_needed()
-                    time.sleep(0.5)  # Brief pause for scroll animation to complete
+                    page.wait_for_load_state("domcontentloaded")
                     
-                    # Start waiting for download before clicking
-                    with page.expect_download() as download_info:
-                        download_button.click()
+                    if check_login_required(page):
+                        perform_login(page)
+                        page.goto(report['report_definition_url'])
+                        page.wait_for_load_state("domcontentloaded")
                     
-                    download = download_info.value
+                    # After starting the attempt, wait up to 30 seconds for any automatic download to start
+                    try:
+                        auto_download = page.wait_for_event("download", timeout=30000)
+                        download = auto_download
+                        # Create new filename with rd_id prefix
+                        original_filename = download.suggested_filename
+                        new_filename = f"{report['rd_id']}_{original_filename}"
+                        file_path = downloads_dir / new_filename
+                        # Save the download with new filename
+                        download.save_as(file_path)
+                        logging.info(f"PDF saved as: {new_filename} (original: {original_filename})")
+                        # Verify file exists and is non-empty
+                        if file_path.exists() and file_path.stat().st_size > 0:
+                            db.mark_pdf_downloaded(report['rd_id'])
+                            logging.info(f"Verified PDF for {report['site']} ({report['rd_id']})")
+                            break
+                        else:
+                            logging.warning(f"Downloaded file not found or empty for {report['site']} ({report['rd_id']}). Retrying...")
+                    except Exception:
+                        logging.info("Download didn't start automatically within 30 seconds, clicking download button")
+                    # Try to find and click download button
+                    try:
+                        download_button = page.locator("#downloadUrl")
+                        download_button.scroll_into_view_if_needed()
+                        time.sleep(0.5)  # Brief pause for scroll animation to complete
+                        
+                        # Start waiting for download before clicking
+                        with page.expect_download() as download_info:
+                            download_button.click()
+                        download = download_info.value
+                        
+                        # Create new filename with rd_id prefix
+                        original_filename = download.suggested_filename
+                        new_filename = f"{report['rd_id']}_{original_filename}"
+                        file_path = downloads_dir / new_filename
+                        
+                        # Save the download with new filename
+                        download.save_as(file_path)
+                        logging.info(f"PDF saved as: {new_filename} (original: {original_filename})")
+                        
+                        # Verify file exists and is non-empty
+                        if file_path.exists() and file_path.stat().st_size > 0:
+                            db.mark_pdf_downloaded(report['rd_id'])
+                            logging.info(f"Verified PDF for {report['site']} ({report['rd_id']})")
+                            break
+                        else:
+                            logging.warning(f"Downloaded file not found or empty for {report['site']} ({report['rd_id']}). Retrying...")
+                    except Exception as e:
+                        logging.warning(f"Download attempt failed for {report['site']}: {e}")
+                        notifier.send_error(f"Download attempt failed for {report['site']}: {e}", "PDF Download Attempt Failed")
+
+                    # Check timeout for this report
+                    if time.time() - start_dl >= max_wait_s:
+                        raise TimeoutError(f"Timed out downloading PDF for {report['site']} ({report['rd_id']}) after {attempt} attempts")
                     
-                    # Create new filename with rd_id prefix
-                    original_filename = download.suggested_filename
-                    file_extension = Path(original_filename).suffix
-                    new_filename = f"{report['rd_id']}_{original_filename}"
-                    
-                    # Save the download with new filename
-                    download.save_as(downloads_dir / new_filename)
-                    logging.info(f"PDF saved as: {new_filename} (original: {original_filename})")
-                    
-                    # Mark PDF as downloaded in database
-                    db.mark_pdf_downloaded(report['rd_id'])
-                    
-                    time.sleep(2)  # Wait for download to complete
-                except Exception as e:
-                    logging.warning(f"No download button found for {report['site']}: {e}")
-                    notifier.send_error(f"No download button found for {report['site']}: {e}", "Download Button Missing")
+                    time.sleep(1)
                     
             except Exception as e:
                 logging.error(f"Error downloading {report['site']}: {e}")
@@ -421,34 +490,35 @@ with sync_playwright() as p:
                     "url": report['report_definition_url']
                 })
         
-        time.sleep(30)
         logging.info("\n================= PDF download process completed!")
     
         # Check if any PDF files were downloaded
         pdf_files = list(downloads_dir.glob('*.pdf')) if downloads_dir.exists() else []
+        all_pdfs_ready = all(list(downloads_dir.glob(f"{r['rd_id']}_*.pdf")) for r in missing_pdf_reports)
         
-        if new_reports and pdf_files:
-            logging.info(f"Found {len(pdf_files)} PDF files for {len(new_reports)} new reports, proceeding with webhook")
+        if missing_pdf_reports and all_pdfs_ready:
+            logging.info(f"All PDFs ready ({len(pdf_files)} files) for {len(missing_pdf_reports)} reports missing PDFs, proceeding with webhook")
             
             # Send to n8n webhook if URL is provided
             webhook_url = os.getenv("N8N_WEBHOOK_URL")
             if webhook_url:
                 try:
-                    send_to_n8n_webhook(new_reports, downloads_dir, webhook_url)
+                    send_to_n8n_webhook(missing_pdf_reports, downloads_dir, webhook_url)
                 except Exception as e:
                     logging.error(f"Error sending to n8n webhook: {e}")
                     notifier.send_error(f"Error sending to n8n webhook: {e}", "Webhook Send Error")
                     send_error_to_n8n_webhook(e, "webhook_error", {
                         "webhook_url": webhook_url, 
-                        "reports_count": len(new_reports)
+                        "reports_count": len(missing_pdf_reports)
                     })
             else:
                 logging.warning("N8N_WEBHOOK_URL environment variable not set")
-        elif not new_reports:
-            logging.info("No new reports found, skipping webhook send to n8n")
+        elif not missing_pdf_reports:
+            logging.info("No reports missing PDFs, skipping webhook send to n8n")
         else:
-            logging.warning("No PDF files found for new reports, skipping webhook send to n8n")
-            notifier.send_error("No PDF files were downloaded for new reports, webhook not sent", "No PDFs Downloaded")
+            missing = [r for r in missing_pdf_reports if not list(downloads_dir.glob(f"{r['rd_id']}_*.pdf"))]
+            logging.warning(f"Missing PDFs for {len(missing)} reports, webhook not sent")
+            notifier.send_error(f"Missing PDFs for {len(missing)} reports, webhook not sent", "Missing PDFs")
             
     except Exception as e:
         logging.error(f"An error occurred: {e}")
@@ -462,3 +532,21 @@ with sync_playwright() as p:
         browser.close()
         
         logging.info("Browser closed successfully")
+
+
+def wait_for_auth_or_table(page, max_wait_ms: int = 300000, poll_interval_ms: int = 500):
+    """Wait until either login form appears or data table is present. Returns 'login', 'table', or 'timeout'."""
+    start = time.time()
+    max_wait_s = max_wait_ms / 1000.0
+    interval_s = poll_interval_ms / 1000.0
+    while time.time() - start < max_wait_s:
+        try:
+            if page.query_selector("#i-username"):
+                return "login"
+            if page.query_selector("#dataTable_length") or page.query_selector("#dataTable tbody tr"):
+                return "table"
+        except Exception:
+            # Ignore transient errors during navigation
+            pass
+        time.sleep(interval_s)
+    return "timeout"
