@@ -13,6 +13,7 @@ class ReportsDatabase:
         """Initialize the database and create tables if they don't exist"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 
                 # Create reports table with rd_id as primary key
@@ -56,6 +57,7 @@ class ReportsDatabase:
         """Insert a single report into the database"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 
                 cursor.execute("""
@@ -94,6 +96,7 @@ class ReportsDatabase:
         
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 
                 for i, report in enumerate(reports, 1):
@@ -153,6 +156,7 @@ class ReportsDatabase:
         """Check if a report exists in the database by rd_id"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 cursor.execute("SELECT 1 FROM reports WHERE rd_id = ?", (rd_id,))
                 return cursor.fetchone() is not None
@@ -176,6 +180,7 @@ class ReportsDatabase:
         """Mark a report as having its PDF downloaded by rd_id"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 cursor.execute(
                     "UPDATE reports SET pdf_downloaded = TRUE WHERE rd_id = ?", 
@@ -192,6 +197,7 @@ class ReportsDatabase:
         """Get all reports for a specific date"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT id, site, site_url, program, report_type, report_definition,
@@ -217,6 +223,7 @@ class ReportsDatabase:
         """Get all reports from the database"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT id, site, site_url, program, report_type, report_definition,
@@ -242,6 +249,7 @@ class ReportsDatabase:
         """Get database statistics"""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout = 300000")
                 cursor = conn.cursor()
                 
                 # Total reports count

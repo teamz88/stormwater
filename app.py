@@ -49,7 +49,7 @@ db = ReportsDatabase()
 def check_login_required(page):
     """Check if login form is present"""
     try:
-        page.wait_for_selector("#i-username", timeout=5000)
+        page.wait_for_selector("#i-username", timeout=300000)
         return True
     except:
         return False
@@ -72,7 +72,7 @@ def perform_login(page):
         
         # Check if login was successful by looking for login form absence
         try:
-            page.wait_for_selector("#i-username", timeout=3000)
+            page.wait_for_selector("#i-username", timeout=300000)
             logging.error("Login failed - login form still present")
             notifier.send_error("Login failed - login form still present", "Authentication Error")
             return False
@@ -113,7 +113,7 @@ def send_error_to_n8n_webhook(error_message, error_type="general", additional_da
     }
     
     try:
-        response = requests.post(webhook_url, json=error_data, timeout=30)
+        response = requests.post(webhook_url, json=error_data, timeout=300)
         response.raise_for_status()
         logging.info(f"Error sent to n8n webhook: {error_type}")
     except Exception as e:
@@ -185,7 +185,7 @@ def send_to_n8n_webhook(reports_data, downloads_dir, webhook_url):
             logging.info(f"Prepared PDF for sending: {pdf_path.name} for {report['site']} with key: {pdf_key}")
         
         # Send the webhook request
-        response = requests.post(webhook_url, data=data, files=files)
+        response = requests.post(webhook_url, data=data, files=files, timeout=300)
         
         if response.status_code == 200:
             logging.info("Successfully sent all reports and PDFs to n8n webhook")
@@ -242,6 +242,10 @@ with sync_playwright() as p:
     )
     
     page = context.new_page()
+    
+    # Increase default timeouts to 5 minutes to accommodate slow pages
+    page.set_default_navigation_timeout(300000)
+    page.set_default_timeout(300000)
     
     try:
         # Navigate to target URL
